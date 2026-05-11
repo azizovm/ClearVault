@@ -1,6 +1,11 @@
 import base64
+import io
+import json
+import re
 import sys
 from pathlib import Path
+
+import pandas as pd
 
 import streamlit as st
 
@@ -10,6 +15,7 @@ APP_DIR = Path(__file__).parent
 CLEARVAULT_LOGO_PATH = APP_DIR / "ClearVault Logo.png"
 CLEARVAULT_LOGO_B64 = base64.b64encode(CLEARVAULT_LOGO_PATH.read_bytes()).decode("utf-8")
 CLEARVAULT_LOGO_URI = f"data:image/png;base64,{CLEARVAULT_LOGO_B64}"
+DOCUMENTS_INDEX_PATH = Path("chroma_db/documents.json")
 
 st.set_page_config(
     page_title="ClearVault",
@@ -203,17 +209,35 @@ section[data-testid="stMain"] { background: var(--surface) !important; }
 
 /* ── File uploader ── */
 [data-testid="stFileUploader"] {
-    background: #f8fafc !important;
-    border: 2px dashed var(--outline-variant) !important;
+    background: #f7f9fb !important;
+    border: 2px dashed #c6c6cd !important;
     border-radius: 4px !important;
-    padding: 10px !important;
+    padding: 40px 24px !important;
+    margin-bottom: 16px !important;
+    text-align: center !important;
 }
-[data-testid="stFileUploader"] section { padding: 0 !important; }
+[data-testid="stFileUploader"] section { padding: 8px 0 !important; }
+[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    gap: 10px !important;
+}
+[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzoneInstructions"] {
+    font-size: 15px !important;
+    font-weight: 600 !important;
+    color: #0f172a !important;
+}
 [data-testid="stFileUploader"] button {
     border-radius: 4px !important;
-    background: white !important;
-    color: var(--navy) !important;
-    border: 1px solid var(--outline-variant) !important;
+    background: var(--navy) !important;
+    color: white !important;
+    border: none !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.05em !important;
+    text-transform: uppercase !important;
+    padding: 10px 22px !important;
 }
 
 /* ── Streamlit containers ── */
@@ -327,6 +351,77 @@ def _clearvault_brand(show_subtitle: bool = False, mark_size: int = 40) -> str:
     '''
 
 
+# ── Table helpers ─────────────────────────────────────────────────────────────
+
+def _extract_markdown_table(text: str) -> str | None:
+    """Return the first complete Markdown table block in text, or None."""
+    lines = text.split("\n")
+    table_lines: list[str] = []
+    in_table = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 2:
+            in_table = True
+            table_lines.append(stripped)
+        elif in_table:
+            break
+    return "\n".join(table_lines) if len(table_lines) >= 3 else None
+
+
+def _markdown_table_to_csv(table_md: str) -> str:
+    """Convert a Markdown pipe table to CSV via pandas."""
+    rows = []
+    for line in table_md.strip().split("\n"):
+        if re.match(r"^[\|\s\-:]+$", line.strip()):
+            continue
+        cells = [c.strip() for c in line.split("|") if c.strip() != ""]
+        if cells:
+            rows.append(cells)
+    if len(rows) < 2:
+        return ""
+    max_cols = max(len(r) for r in rows)
+    rows = [r + [""] * (max_cols - len(r)) for r in rows]
+    df = pd.DataFrame(rows[1:], columns=rows[0])
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    return buf.getvalue()
+
+
+# ── Document index persistence ────────────────────────────────────────────────
+
+def _save_documents_index() -> None:
+    DOCUMENTS_INDEX_PATH.parent.mkdir(exist_ok=True)
+    with open(DOCUMENTS_INDEX_PATH, "w") as f:
+        json.dump(st.session_state.documents, f, indent=2)
+
+
+def _load_documents_index() -> dict:
+    if not DOCUMENTS_INDEX_PATH.exists():
+        return {}
+    try:
+        with open(DOCUMENTS_INDEX_PATH) as f:
+            data = json.load(f)
+        return {
+            doc_name: doc_info
+            for doc_name, doc_info in data.items()
+            if Path(doc_info.get("path", "")).exists()
+        }
+    except Exception:
+        return {}
+
+
+def _remove_document(doc_name: str) -> None:
+    from src.vector_store import reset_collection
+    reset_collection(doc_name)
+    st.session_state.documents.pop(doc_name, None)
+    if st.session_state.current_doc == doc_name:
+        remaining = list(st.session_state.documents.keys())
+        st.session_state.current_doc = remaining[0] if remaining else None
+        st.session_state.chat_history = []
+        st.session_state.cited_page = None
+    _save_documents_index()
+
+
 # ── Session state ─────────────────────────────────────────────────────────────
 
 def _init_state():
@@ -340,6 +435,14 @@ def _init_state():
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+    # Recover already-indexed documents after a browser refresh
+    if not st.session_state.documents:
+        recovered = _load_documents_index()
+        if recovered:
+            st.session_state.documents = recovered
+            if not st.session_state.current_doc:
+                st.session_state.current_doc = next(iter(recovered))
 
 
 _init_state()
@@ -458,11 +561,9 @@ def _top_bar(active_tab: str = "Due Diligence"):
 # ── Document processing ───────────────────────────────────────────────────────
 
 def _process_document(pdf_path: str):
-    from src.extractor import get_page_count
-    from src.vector_store import index_batch, reset_collection
+    from src.extractor import extract_pages
+    from src.vector_store import index_document
     from src.llm import extract_liabilities
-    import pdfplumber
-    from src.extractor import Chunk
 
     doc_name = Path(pdf_path).name
 
@@ -471,71 +572,49 @@ def _process_document(pdf_path: str):
         return
 
     with st.status(f"Processing {doc_name}…", expanded=True) as status:
-        # ── Step 1: local structuring ──────────────────────────────────────
-        st.write("📄 **Local Structuring** — extracting text and tables…")
+        # ── Step 1: Render pages to images ────────────────────────────────
+        st.write("📄 **Local Structuring** — rendering PDF pages to images…")
         prog1 = st.progress(0.0, text="Local Structuring")
 
-        page_count = get_page_count(pdf_path)
-        all_chunks: list[Chunk] = []
-        chunk_size = 400
+        pages = extract_pages(
+            pdf_path,
+            on_progress=lambda done, total: prog1.progress(
+                done / total,
+                text=f"Local Structuring — page {done}/{total}",
+            ),
+        )
+        page_count = len(pages)
 
-        reset_collection(doc_name)
+        st.write(f"✅ Rendered **{page_count} pages** to local image cache")
 
-        with pdfplumber.open(pdf_path) as pdf:
-            for i, page in enumerate(pdf.pages):
-                text = page.extract_text() or ""
-                for table in page.extract_tables() or []:
-                    if table:
-                        rows = [
-                            " | ".join(str(c) if c else "" for c in row)
-                            for row in table if row
-                        ]
-                        text += "\n[TABLE]\n" + "\n".join(rows) + "\n[/TABLE]"
+        # ── Step 2: Vision embedding + indexing ───────────────────────────
+        st.write("🔍 **Vision Embedding** — indexing with ColQwen2…")
+        st.caption("Loading vision model on first run — this may take a few minutes.")
+        prog2 = st.progress(0.0, text="Vision Embedding — loading model…")
 
-                words = text.split()
-                for j in range(0, max(1, len(words)), chunk_size):
-                    chunk_text = " ".join(words[j : j + chunk_size])
-                    if chunk_text.strip():
-                        all_chunks.append(
-                            Chunk(
-                                text=chunk_text,
-                                page_num=i + 1,
-                                doc_name=doc_name,
-                                chunk_id=f"{doc_name}_p{i+1}_c{j // chunk_size}",
-                            )
-                        )
+        index_document(
+            pages,
+            doc_name,
+            on_progress=lambda done, total: prog2.progress(
+                done / total,
+                text="Vision Embedding — loading model…" if done == 0
+                     else "Vision Embedding — complete",
+            ),
+        )
 
-                prog1.progress((i + 1) / page_count, text=f"Local Structuring — page {i+1}/{page_count}")
+        st.write(f"✅ Indexed **{page_count} pages** with visual patch embeddings")
 
-        st.write(f"✅ Extracted **{len(all_chunks)} chunks** from {page_count} pages")
+        # ── Step 3: AI Liability Scan ─────────────────────────────────────
+        st.write("⚠️ **AI Liability Scan** — scanning with Gemini Vision…")
 
-        # ── Step 2: embedding + indexing ──────────────────────────────────
-        st.write("🔍 **OCR Analysis & Extraction** — embedding and indexing…")
-        prog2 = st.progress(0.0, text="OCR Analysis & Extraction")
-
-        batch_size = 100
-        for i in range(0, len(all_chunks), batch_size):
-            batch = all_chunks[i : i + batch_size]
-            index_batch(batch, doc_name)
-            prog2.progress(
-                min(1.0, (i + batch_size) / len(all_chunks)),
-                text=f"OCR Analysis & Extraction — {min(i + batch_size, len(all_chunks))}/{len(all_chunks)} chunks",
-            )
-
-        st.write(f"✅ Indexed **{len(all_chunks)} chunks** in ChromaDB")
-
-        # ── Step 3: liability scan ─────────────────────────────────────────
-        st.write("⚠️ **AI Liability Scan** — identifying risks…")
-
-        # Sample diverse chunks across document for broad coverage
-        step = max(1, len(all_chunks) // 30)
-        scan_chunks = [
-            {"text": c.text, "page_num": c.page_num}
-            for c in all_chunks[::step][:30]
+        step = max(1, page_count // 10)
+        scan_pages = [
+            {"image_path": p.image_path, "page_num": p.page_num}
+            for p in pages[::step][:10]
         ]
 
         try:
-            liabilities = extract_liabilities(scan_chunks)
+            liabilities = extract_liabilities(scan_pages)
         except Exception as e:
             st.warning(f"Liability scan failed: {e}")
             liabilities = []
@@ -545,10 +624,12 @@ def _process_document(pdf_path: str):
         st.session_state.documents[doc_name] = {
             "path": pdf_path,
             "page_count": page_count,
-            "chunk_count": len(all_chunks),
+            "chunk_count": page_count,
             "liabilities": liabilities,
+            "image_dir": str(Path("data") / "images" / Path(pdf_path).stem),
         }
         st.session_state.current_doc = doc_name
+        _save_documents_index()
 
         status.update(
             label=f"✅ {doc_name} — Processing Complete",
@@ -764,7 +845,7 @@ def _page_document_hub():
     st.markdown('<div class="page-shell">', unsafe_allow_html=True)
 
     st.markdown(
-        """
+        f"""
         <div class="page-header">
             <div>
                 <h2 class="page-title">Document Ingestion</h2>
@@ -799,22 +880,7 @@ def _page_document_hub():
             _process_document(str(sample_path))
             st.rerun()
 
-    st.markdown(
-        """
-        <section class="dropzone-shell" style="padding:4px;overflow:hidden;">
-            <div style="border:2px dashed #c6c6cd;border-radius:4px;background:#f7f9fb;padding:56px 24px;text-align:center;">
-                <div style="width:64px;height:64px;margin:0 auto 16px;border-radius:9999px;background:#eceef0;border:1px solid #c6c6cd;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 6px rgba(0,0,0,0.05);">
-                    <span class="material-symbols-outlined" style="font-size:32px;color:#0f172a;">drive_folder_upload</span>
-                </div>
-                <div style="font-size:24px;line-height:32px;font-weight:600;letter-spacing:-0.01em;color:#0f172a;margin-bottom:8px;">Drop Secure PDF Data Room</div>
-                <div style="max-width:640px;margin:0 auto 24px;color:#475569;font-size:14px;line-height:20px;">Drag and drop financial schedules, cap tables, or legal disclosures here. Supported formats: .pdf, .docx, .xlsx</div>
-                <div style="display:inline-flex;align-items:center;justify-content:center;padding:0 22px;height:40px;border-radius:4px;border:1px solid rgba(255,255,255,0.2);background:#0f172a;color:white;font-size:12px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;">Browse Local Machine</div>
-            </div>
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
-
+    st.markdown(_section_label("Drop Secure PDF Data Room"), unsafe_allow_html=True)
     uploaded = st.file_uploader(
         "Drop Secure PDF Data Room",
         type=["pdf"],
@@ -835,44 +901,52 @@ def _page_document_hub():
         st.markdown('<div style="height:16px;"></div>', unsafe_allow_html=True)
         st.markdown(_section_label(f"Active Processing Queue · {len(st.session_state.documents)}"), unsafe_allow_html=True)
 
-        for doc_name, doc_info in st.session_state.documents.items():
+        for doc_name, doc_info in list(st.session_state.documents.items()):
             n_risks = len(doc_info.get("liabilities", []))
-            st.markdown(
-                f"""
-                <div class="queue-card" style="padding:16px;margin-bottom:12px;box-shadow:0 4px 6px rgba(0,0,0,0.02);">
-                    <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:16px;">
-                        <div style="display:flex;align-items:center;gap:12px;min-width:0;">
-                            <div style="width:32px;height:32px;background:#ffdad6;color:#93000a;border-radius:4px;border:1px solid rgba(186,26,26,0.2);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;">PDF</div>
-                            <div style="min-width:0;">
-                                <div style="font-size:14px;font-weight:600;color:#191c1e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:520px;">{doc_name}</div>
-                                <div style="font-size:12px;color:#475569;">{doc_info.get('page_count', 0)} pages · {doc_info.get('chunk_count', 0)} chunks indexed · {n_risks} risks identified</div>
+            card_col, btn_col = st.columns([13, 1])
+            with card_col:
+                st.markdown(
+                    f"""
+                    <div class="queue-card" style="padding:16px;margin-bottom:0;box-shadow:0 4px 6px rgba(0,0,0,0.02);">
+                        <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:16px;">
+                            <div style="display:flex;align-items:center;gap:12px;min-width:0;">
+                                <div style="width:32px;height:32px;background:#ffdad6;color:#93000a;border-radius:4px;border:1px solid rgba(186,26,26,0.2);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;">PDF</div>
+                                <div style="min-width:0;">
+                                    <div style="font-size:14px;font-weight:600;color:#191c1e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:520px;">{doc_name}</div>
+                                    <div style="font-size:12px;color:#475569;">{doc_info.get('page_count', 0)} pages · {doc_info.get('chunk_count', 0)} chunks indexed · {n_risks} risks identified</div>
+                                </div>
+                            </div>
+                            <div style="display:flex;align-items:center;gap:8px;color:#069669;font-size:11px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;">
+                                <span class="material-symbols-outlined" style="font-size:16px;">check_circle</span>
+                                Indexed
                             </div>
                         </div>
-                        <div style="display:flex;align-items:center;gap:8px;color:#0f172a;font-size:11px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;">
-                            <span class="material-symbols-outlined" style="font-size:16px;">autorenew</span>
-                            Indexed
+                        <div style="display:flex;flex-direction:column;gap:12px;">
+                            <div style="display:flex;flex-direction:column;gap:6px;">
+                                <div style="display:flex;justify-content:space-between;align-items:end;">
+                                    <span style="font-size:11px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;color:#475569;">Local Structuring</span>
+                                    <span style="font-size:13px;color:#0f172a;font-weight:600;">100%</span>
+                                </div>
+                                <div style="height:6px;background:#e0e3e5;border-radius:9999px;overflow:hidden;"><div style="height:100%;width:100%;background:#069669;border-radius:9999px;"></div></div>
+                            </div>
+                            <div style="display:flex;flex-direction:column;gap:6px;">
+                                <div style="display:flex;justify-content:space-between;align-items:end;">
+                                    <span style="font-size:11px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;color:#475569;">OCR Analysis &amp; Extraction</span>
+                                    <span style="font-size:13px;color:#0f172a;font-weight:600;">100%</span>
+                                </div>
+                                <div style="height:6px;background:#e0e3e5;border-radius:9999px;overflow:hidden;"><div style="height:100%;width:100%;background:#069669;border-radius:9999px;"></div></div>
+                            </div>
                         </div>
                     </div>
-                    <div style="display:flex;flex-direction:column;gap:12px;">
-                        <div style="display:flex;flex-direction:column;gap:6px;">
-                            <div style="display:flex;justify-content:space-between;align-items:end;">
-                                <span style="font-size:11px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;color:#475569;">Local Structuring</span>
-                                <span style="font-size:13px;color:#0f172a;font-weight:600;">100%</span>
-                            </div>
-                            <div style="height:6px;background:#e0e3e5;border-radius:9999px;overflow:hidden;"><div style="height:100%;width:100%;background:#069669;border-radius:9999px;"></div></div>
-                        </div>
-                        <div style="display:flex;flex-direction:column;gap:6px;">
-                            <div style="display:flex;justify-content:space-between;align-items:end;">
-                                <span style="font-size:11px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;color:#475569;">OCR Analysis &amp; Extraction</span>
-                                <span style="font-size:13px;color:#0f172a;font-weight:600;">64%</span>
-                            </div>
-                            <div style="height:6px;background:#e0e3e5;border-radius:9999px;overflow:hidden;"><div style="height:100%;width:64%;background:#069669;border-radius:9999px;"></div></div>
-                        </div>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with btn_col:
+                st.markdown('<div style="padding-top:12px;"></div>', unsafe_allow_html=True)
+                if st.button("✕", key=f"remove_{doc_name}", type="secondary", help=f"Remove {doc_name}"):
+                    _remove_document(doc_name)
+                    st.rerun()
+            st.markdown('<div style="height:12px;"></div>', unsafe_allow_html=True)
 
         if st.button("Open in Audit Analysis", type="primary"):
             st.session_state.page = "audit_analysis"
@@ -906,17 +980,24 @@ def _handle_question(question: str, doc_name: str):
     )
     if result["cited_pages"]:
         st.session_state.cited_page = result["cited_pages"][0]
+        st.session_state["pdf_page_nav"] = result["cited_pages"][0]
 
 
 def _render_page_image(pdf_path: str, page_num: int, page_count: int):
+    # Prefer pre-rendered images from the ingest pipeline (faster, consistent DPI)
+    prerendered = Path("data") / "images" / Path(pdf_path).stem / f"page_{page_num:04d}.png"
+    if prerendered.exists():
+        st.image(str(prerendered), use_container_width=True)
+        st.caption(f"Page {page_num} of {page_count}")
+        return
+
+    # Fallback: render on demand with PyMuPDF
     try:
         import fitz
-
         doc = fitz.open(pdf_path)
         if 1 <= page_num <= len(doc):
             page = doc[page_num - 1]
-            mat = fitz.Matrix(1.5, 1.5)
-            pix = page.get_pixmap(matrix=mat)
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
             st.image(pix.tobytes("png"), use_container_width=True)
             st.caption(f"Page {page_num} of {page_count}")
         doc.close()
@@ -959,7 +1040,7 @@ def _page_audit_analysis():
         current = doc_options[0]
 
     st.markdown(
-        """
+        f"""
         <div class="page-header" style="margin-bottom:12px;">
             <div>
                 <h2 class="page-title">Audit Analysis</h2>
@@ -969,7 +1050,7 @@ def _page_audit_analysis():
                 {_clearvault_mark(size=24)}
                 <div style="display:flex;flex-direction:column;line-height:1;">
                     <span style="font-size:11px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#191c1e;margin-bottom:3px;">Analysis Terminal</span>
-                    <span style="font-size:12px;font-weight:600;color:#475569;">llama-3.3-70b · Groq</span>
+                    <span style="font-size:12px;font-weight:600;color:#475569;">gemini-2.0-flash · Vision</span>
                 </div>
             </div>
         </div>
@@ -994,7 +1075,7 @@ def _page_audit_analysis():
         st.markdown(
             f'<div style="display:flex;align-items:center;gap:10px;padding-top:31px;flex-wrap:wrap;">'
             + _badge("PDF", "info")
-            + f'<span style="font-size:14px;font-weight:500;color:#475569;">📄 {doc_info.get("page_count",0)} pages · 🔗 {doc_info.get("chunk_count",0)} chunks indexed</span>'
+            + f'<span style="font-size:14px;font-weight:500;color:#475569;">📄 {doc_info.get("page_count",0)} pages · 🔗 {doc_info.get("page_count",0)} pages indexed</span>'
             + _badge("✓ Verified", "verified")
             + '</div>',
             unsafe_allow_html=True,
@@ -1020,7 +1101,7 @@ def _page_audit_analysis():
             "</div>"
             '<div style="display:flex;align-items:center;gap:6px;">'
             '<div style="width:8px;height:8px;border-radius:9999px;background:#069669;animation:pulse 2s infinite;"></div>'
-            '<span style="font-size:12px;color:#475569;">llama-3.3-70b · Groq</span>'
+            '<span style="font-size:12px;color:#475569;">gemini-2.0-flash · Vision</span>'
             "</div>"
             "</div>",
             unsafe_allow_html=True,
@@ -1043,7 +1124,7 @@ def _page_audit_analysis():
                     unsafe_allow_html=True,
                 )
 
-            for msg in st.session_state.chat_history:
+            for _i, msg in enumerate(st.session_state.chat_history):
                 if msg["role"] == "user":
                     st.markdown(
                         f'<div style="display:flex;justify-content:flex-end;margin:8px 0;">'
@@ -1088,6 +1169,19 @@ def _page_audit_analysis():
                         )
 
                     st.markdown("</div></div>", unsafe_allow_html=True)
+
+                    # CSV export — rendered outside the HTML card as a Streamlit widget
+                    _tbl = _extract_markdown_table(answer)
+                    if _tbl:
+                        _csv = _markdown_table_to_csv(_tbl)
+                        if _csv:
+                            st.download_button(
+                                label="⬇  Download Table as CSV",
+                                data=_csv,
+                                file_name=f"table_p{cited[0] if cited else _i}.csv",
+                                mime="text/csv",
+                                key=f"dl_{_i}",
+                            )
 
         # Input form
         st.markdown('<div style="padding:12px 0 0 0;">', unsafe_allow_html=True)

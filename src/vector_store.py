@@ -1,98 +1,123 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
-import chromadb
-from src.extractor import Chunk
+import shutil
+from collections.abc import Callable
+from pathlib import Path
 
-_client: Optional[chromadb.PersistentClient] = None
-
-
-def _get_client() -> chromadb.PersistentClient:
-    global _client
-    if _client is None:
-        _client = chromadb.PersistentClient(path="./chroma_db")
-    return _client
+_BYALDI_ROOT = Path(".byaldi")
 
 
-def _collection_name(doc_name: str) -> str:
+def _get_device() -> str:
+    import torch
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+
+# Module-level cache: index_name → loaded RAGMultiModalModel instance.
+# Persists across Streamlit reruns within the same server process.
+_rag_cache: dict[str, object] = {}
+
+# Cached pretrained model — loaded once, reused across all index_document() calls.
+_pretrained_model: object = None
+
+
+def _index_name(doc_name: str) -> str:
     sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", doc_name)[:60]
     return sanitized if len(sanitized) >= 3 else sanitized + "doc"
 
 
-def index_document(chunks: list[Chunk], doc_name: str) -> None:
-    client = _get_client()
-    name = _collection_name(doc_name)
+def _get_rag_for_doc(doc_name: str):
+    """Return a loaded RAGMultiModalModel for doc_name, loading from disk if needed."""
+    from byaldi import RAGMultiModalModel
 
-    try:
-        client.delete_collection(name)
-    except Exception:
-        pass
+    index_name = _index_name(doc_name)
 
-    collection = client.create_collection(name)
+    if index_name in _rag_cache:
+        return _rag_cache[index_name]
 
-    batch_size = 100
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i : i + batch_size]
-        collection.add(
-            ids=[c.chunk_id for c in batch],
-            documents=[c.text for c in batch],
-            metadatas=[{"page_num": c.page_num, "doc_name": c.doc_name} for c in batch],
-        )
+    index_path = _BYALDI_ROOT / index_name
+    if not index_path.exists():
+        return None
 
-
-def index_batch(chunks: list[Chunk], doc_name: str) -> None:
-    """Add a batch of chunks to an existing collection (used for progress reporting)."""
-    client = _get_client()
-    name = _collection_name(doc_name)
-
-    try:
-        collection = client.get_collection(name)
-    except Exception:
-        collection = client.create_collection(name)
-
-    collection.add(
-        ids=[c.chunk_id for c in chunks],
-        documents=[c.text for c in chunks],
-        metadatas=[{"page_num": c.page_num, "doc_name": c.doc_name} for c in chunks],
+    rag = RAGMultiModalModel.from_index(
+        index_path=str(_BYALDI_ROOT),
+        index_name=index_name,
+        device=_get_device(),
     )
+    _rag_cache[index_name] = rag
+    return rag
+
+
+def _load_pretrained() -> object:
+    """Load ColQwen2 once and cache it for the lifetime of the process."""
+    global _pretrained_model
+    if _pretrained_model is None:
+        from byaldi import RAGMultiModalModel
+        _pretrained_model = RAGMultiModalModel.from_pretrained(
+            "vidore/colqwen2-v1.0", verbose=0, device=_get_device()
+        )
+    return _pretrained_model
+
+
+def index_document(
+    pages: list,
+    doc_name: str,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> None:
+    """Embed and index pre-rendered page images using ColQwen2 via byaldi."""
+    if not pages:
+        return
+
+    image_dir = str(Path(pages[0].image_path).parent)
+    index_name = _index_name(doc_name)
+    n = len(pages)
+
+    if on_progress:
+        on_progress(0, n)
+
+    rag = _load_pretrained()
+    rag.index(
+        input_path=image_dir,
+        index_name=index_name,
+        store_collection_with_index=True,
+        overwrite=True,
+        max_image_width=1024,
+        max_image_height=1024,
+    )
+    _rag_cache[index_name] = rag
+
+    if on_progress:
+        on_progress(n, n)
 
 
 def reset_collection(doc_name: str) -> None:
-    client = _get_client()
-    name = _collection_name(doc_name)
-    try:
-        client.delete_collection(name)
-    except Exception:
-        pass
+    """Remove a document's index from the in-memory cache and disk."""
+    index_name = _index_name(doc_name)
+    _rag_cache.pop(index_name, None)
+    index_path = _BYALDI_ROOT / index_name
+    if index_path.exists():
+        shutil.rmtree(index_path)
 
 
-def query_document(question: str, doc_name: str, n_results: int = 5) -> list[dict]:
-    client = _get_client()
-    name = _collection_name(doc_name)
-
-    try:
-        collection = client.get_collection(name)
-    except Exception:
+def query_document(question: str, doc_name: str, n_results: int = 3) -> list[dict]:
+    """Semantic search over visual page embeddings. Returns dicts with base64 + page_num."""
+    rag = _get_rag_for_doc(doc_name)
+    if rag is None:
         return []
 
-    count = collection.count()
-    if count == 0:
-        return []
-
-    results = collection.query(
-        query_texts=[question],
-        n_results=min(n_results, count),
-    )
-
-    if not results["documents"] or not results["documents"][0]:
-        return []
+    results = rag.search(question, k=n_results, return_base64_results=True)
 
     return [
         {
-            "text": results["documents"][0][i],
-            "page_num": results["metadatas"][0][i]["page_num"],
-            "doc_name": results["metadatas"][0][i]["doc_name"],
+            "base64": r.base64,
+            "page_num": r.page_num,
+            "score": r.score,
         }
-        for i in range(len(results["documents"][0]))
+        for r in results
+        if r.base64
     ]
