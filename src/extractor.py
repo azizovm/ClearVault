@@ -41,7 +41,7 @@ def _process_page(idx: int, pdf_path: str, dpi: int, image_dir: Path, doc_name: 
 
 def extract_pages(
     pdf_path: str,
-    dpi: int = 150,
+    dpi: int = 72,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> list[Page]:
     """PDF sayfalarını PNG olarak paralel işler ve kaydeder. M4 için optimize edilmiştir."""
@@ -72,5 +72,32 @@ def extract_pages(
 
     # as_completed sonuçları karışık sırayla döndürebileceği için sayfa numarasına göre sıralıyoruz
     pages.sort(key=lambda p: p.page_num)
-    
+
     return pages
+
+
+def extract_page_text(pdf_path: str, page_num: int) -> str:
+    """Extract deterministic raw text from a PDF page (1-indexed) using PyMuPDF. Return '' on failure."""
+    try:
+        with fitz.open(pdf_path) as doc:
+            idx = page_num - 1
+            if idx < 0 or idx >= len(doc):
+                return ""
+            page = doc[idx]
+            text = page.get_text("text")
+            if text.strip():
+                return text
+            blocks = page.get_text("blocks")
+            parts = [b[4] for b in blocks if isinstance(b[4], str) and b[4].strip()]
+            return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def find_pdf_path(doc_name: str) -> str | None:
+    """Locate the original PDF on disk given the document name (searches data/ and samples/)."""
+    name = doc_name if doc_name.lower().endswith(".pdf") else doc_name + ".pdf"
+    for search_root in (Path("data"), Path("samples")):
+        for match in search_root.rglob(name):
+            return str(match)
+    return None

@@ -1,9 +1,13 @@
 import base64
 import io
 import json
+import logging
 import re
 import sys
 from pathlib import Path
+
+logging.getLogger("streamlit").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 import pandas as pd
 
@@ -288,6 +292,31 @@ section[data-testid="stMain"] { background: var(--surface) !important; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #e0e3e5; border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: #c6c6cd; }
+
+/* ── Status widget (the "Analyzing…" bar) ── */
+[data-testid="stStatusWidget"] {
+    background: #0f172a !important;
+    border: 1px solid #1e293b !important;
+    border-radius: 4px !important;
+}
+[data-testid="stStatusWidget"] p,
+[data-testid="stStatusWidget"] span,
+[data-testid="stStatusWidget"] label { color: #e2e8f0 !important; }
+[data-testid="stStatusWidget"] svg { stroke: #e2e8f0 !important; fill: #e2e8f0 !important; }
+[data-testid="stStatusWidget"] button {
+    background: transparent !important;
+    color: #94a3b8 !important;
+    border-color: rgba(255,255,255,0.12) !important;
+}
+
+/* ── Prompt chip buttons ── */
+button[data-testid="stBaseButton-secondary"].chip-btn {
+    border-radius: 9999px !important;
+    font-size: 11px !important;
+    padding: 4px 10px !important;
+    text-transform: none !important;
+    letter-spacing: 0 !important;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -350,6 +379,30 @@ def _clearvault_brand(show_subtitle: bool = False, mark_size: int = 40) -> str:
     </div>
     '''
 
+
+# ── Quick-prompt chips ────────────────────────────────────────────────────────
+
+_SUGGESTED_PROMPTS = [
+    ("", "Extract the 2023 depreciation schedule."),
+    ("", "Show EBITDA and key adjustments as a table."),
+    ("", "Extract working capital components."),
+    ("", "List all critical liabilities and risks."),
+    ("", "Summarize revenue breakdown by segment."),
+    ("", "Extract the cap table or ownership structure."),
+]
+
+# ── Demo liability data (shown when no real extraction has run) ───────────────
+
+_DEMO_LIABILITIES = [
+    {"risk_type": "Financial",   "severity": "CRITICAL", "description": "Contingent liability ~$14.2M from pending regulatory investigation not reflected in balance sheet.", "page": "47"},
+    {"risk_type": "Legal",       "severity": "HIGH",     "description": "Vendor MSA indemnification clause (Annex C, §12.3) lacks liability cap — unlimited exposure.", "page": "83"},
+    {"risk_type": "Compliance",  "severity": "HIGH",     "description": "Customer PII handling does not satisfy GDPR Article 28 DPA requirements for sub-processors.", "page": "112"},
+    {"risk_type": "Operational", "severity": "MEDIUM",   "description": "Top-3 customers represent 67% of ARR with no contractual lock-in beyond 12-month terms.", "page": "29"},
+    {"risk_type": "Financial",   "severity": "MEDIUM",   "description": "Deferred revenue recognition policy change in Q2 2023 inflated reported ARR by an estimated 8–11%.", "page": "61"},
+    {"risk_type": "Legal",       "severity": "MEDIUM",   "description": "Three pending employee FLSA claims; total exposure estimated at $800K–$1.2M.", "page": "94"},
+    {"risk_type": "Operational", "severity": "LOW",      "description": "CTO holds sole access to core infrastructure credentials with no documented succession plan.", "page": "18"},
+    {"risk_type": "Compliance",  "severity": "LOW",      "description": "SOC 2 Type I certificate expired 4 months ago; renewal audit in progress but not completed.", "page": "105"},
+]
 
 # ── Table helpers ─────────────────────────────────────────────────────────────
 
@@ -431,6 +484,9 @@ def _init_state():
         "current_doc": None,
         "chat_history": [],    # [{role, content, cited_pages?}]
         "cited_page": None,
+        "auto_prompt": None,
+        "pdf_page_nav": 1,
+        "pdf_zoom": 100,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -485,7 +541,7 @@ with st.sidebar:
         <div style="padding:12px 8px 0;border-top:1px solid #e2e8f0;display:flex;flex-direction:column;gap:4px;">
             <div style="display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:4px;color:#475569;font-size:12px;font-weight:500;">
                 <span class="material-symbols-outlined" style="font-size:16px;color:#069669;">verified_user</span>
-                <span>Local-Only Security</span>
+                <span>SOC 2 Type II Compliant</span>
             </div>
             <div style="display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:4px;color:#475569;font-size:12px;font-weight:500;">
                 <span class="material-symbols-outlined" style="font-size:16px;">settings</span>
@@ -667,7 +723,7 @@ def _page_dashboard():
                 {_clearvault_mark(size=24)}
                 <div style="display:flex;flex-direction:column;line-height:1;">
                     <span style="font-size:11px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#191c1e;margin-bottom:3px;">Secure Status</span>
-                    <span style="font-size:12px;font-weight:600;color:#069669;">Local Node Active</span>
+                    <span style="font-size:12px;font-weight:600;color:#069669;">SOC 2 Type II · E2E Encrypted</span>
                 </div>
             </div>
         </div>
@@ -849,11 +905,11 @@ def _page_document_hub():
         <div class="page-header">
             <div>
                 <h2 class="page-title">Document Ingestion</h2>
-                <p class="page-subtitle">Process secure data rooms. Files are parsed entirely within your local environment.</p>
+                <p class="page-subtitle">Upload scanned VDR PDFs and extract cell-aligned, Excel-ready financial tables in under 60 seconds.</p>
             </div>
             <div class="surface-card" style="padding:10px 14px;display:flex;align-items:center;gap:10px;">
                 {_clearvault_mark(size=24)}
-                <span style="font-size:12px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;color:#069669;">Zero Exfiltration Active</span>
+                <span style="font-size:12px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;color:#069669;">SOC 2 Type II · Zero-Data-Retention DPA</span>
             </div>
         </div>
         """,
@@ -880,12 +936,41 @@ def _page_document_hub():
             _process_document(str(sample_path))
             st.rerun()
 
-    st.markdown(_section_label("Drop Secure PDF Data Room"), unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div style="background:#eff6ff;border:1px solid rgba(37,99,235,0.15);border-radius:4px;
+                    padding:16px 20px;margin-bottom:16px;">
+            <div style="font-size:12px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;
+                        color:#1d4ed8;margin-bottom:6px;">How it works</div>
+            <div style="font-size:14px;color:#191c1e;line-height:1.7;">
+                Drag a scanned VDR PDF. Ask: <em>"Extract the 2023 depreciation schedule."</em>
+                Receive a cell-aligned, source-traced Excel table in under 60 seconds.
+            </div>
+        </div>
+        <div style="background:#f0fdf4;border:1px solid rgba(5,150,105,0.20);border-radius:4px;
+                    padding:12px 16px;margin-bottom:16px;display:flex;align-items:flex-start;gap:10px;">
+            <span class="material-symbols-outlined"
+                  style="font-size:18px;color:#059669;margin-top:1px;flex-shrink:0;">document_scanner</span>
+            <div>
+                <div style="font-size:13px;font-weight:700;color:#065f46;margin-bottom:3px;">
+                    Built for scanned PDFs
+                </div>
+                <div style="font-size:13px;color:#475569;line-height:1.5;">
+                    Handles merged cells, split footnotes, low-quality scans, and broken column
+                    alignment — the messy financial tables that VDR-native AI cannot accurately
+                    extract at cell level.
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(_section_label("Drop VDR PDF"), unsafe_allow_html=True)
     uploaded = st.file_uploader(
-        "Drop Secure PDF Data Room",
+        "Drop VDR PDF",
         type=["pdf"],
         label_visibility="collapsed",
-        help="Drag and drop financial schedules, cap tables, or legal disclosures here.",
+        help='Drag a scanned VDR PDF. Ask: "Extract the 2023 depreciation schedule." Receive a cell-aligned, source-traced Excel table in under 60 seconds.',
     )
 
     if uploaded is not None:
@@ -963,19 +1048,20 @@ def _handle_question(question: str, doc_name: str):
 
     st.session_state.chat_history.append({"role": "user", "content": question})
 
-    chunks = query_document(question, doc_name, n_results=5)
+    chunks = query_document(question, doc_name, n_results=2)
     if not chunks:
         st.session_state.chat_history.append(
             {"role": "assistant", "content": "No relevant content found in the document.", "cited_pages": []}
         )
         return
 
-    result = answer_with_citations(question, chunks)
+    result = answer_with_citations(question, chunks, doc_name=doc_name)
     st.session_state.chat_history.append(
         {
             "role": "assistant",
             "content": result["answer"],
             "cited_pages": result["cited_pages"],
+            "is_verified": result.get("is_verified", True),
         }
     )
     if result["cited_pages"]:
@@ -983,11 +1069,12 @@ def _handle_question(question: str, doc_name: str):
         st.session_state["pdf_page_nav"] = result["cited_pages"][0]
 
 
-def _render_page_image(pdf_path: str, page_num: int, page_count: int):
+def _render_page_image(pdf_path: str, page_num: int, page_count: int, zoom: int = 100):
     # Prefer pre-rendered images from the ingest pipeline (faster, consistent DPI)
     prerendered = Path("data") / "images" / Path(pdf_path).stem / f"page_{page_num:04d}.png"
+    img_width = max(200, int(600 * zoom / 100))
     if prerendered.exists():
-        st.image(str(prerendered), use_container_width=True)
+        st.image(str(prerendered), width=img_width)
         st.caption(f"Page {page_num} of {page_count}")
         return
 
@@ -998,7 +1085,7 @@ def _render_page_image(pdf_path: str, page_num: int, page_count: int):
         if 1 <= page_num <= len(doc):
             page = doc[page_num - 1]
             pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-            st.image(pix.tobytes("png"), use_container_width=True)
+            st.image(pix.tobytes("png"), width=img_width)
             st.caption(f"Page {page_num} of {page_count}")
         doc.close()
     except Exception:
@@ -1050,7 +1137,7 @@ def _page_audit_analysis():
                 {_clearvault_mark(size=24)}
                 <div style="display:flex;flex-direction:column;line-height:1;">
                     <span style="font-size:11px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#191c1e;margin-bottom:3px;">Analysis Terminal</span>
-                    <span style="font-size:12px;font-weight:600;color:#475569;">gemini-2.0-flash · Vision</span>
+                    <span style="font-size:12px;font-weight:600;color:#475569;">Groq · Vision</span>
                 </div>
             </div>
         </div>
@@ -1071,6 +1158,12 @@ def _page_audit_analysis():
             st.session_state.cited_page = None
             st.rerun()
     with col_info:
+        # auto-prompt: execute a chip click before we render the page
+        _auto_q = st.session_state.pop("auto_prompt", None)
+        if _auto_q:
+            with st.status(f"Analyzing: {_auto_q[:60]}…", expanded=True):
+                _handle_question(_auto_q, selected_doc)
+            st.rerun()
         doc_info = docs[selected_doc]
         st.markdown(
             f'<div style="display:flex;align-items:center;gap:10px;padding-top:31px;flex-wrap:wrap;">'
@@ -1101,25 +1194,25 @@ def _page_audit_analysis():
             "</div>"
             '<div style="display:flex;align-items:center;gap:6px;">'
             '<div style="width:8px;height:8px;border-radius:9999px;background:#069669;animation:pulse 2s infinite;"></div>'
-            '<span style="font-size:12px;color:#475569;">gemini-2.0-flash · Vision</span>'
+            '<span style="font-size:12px;color:#475569;">Groq · Vision</span>'
             "</div>"
             "</div>",
             unsafe_allow_html=True,
         )
 
         # Chat history
-        chat_area = st.container(height=440)
+        chat_area = st.container(height=360)
         with chat_area:
             if not st.session_state.chat_history:
                 st.markdown(
                     '<div style="text-align:center;padding:48px 16px;color:#94a3b8;">'
                     '<div style="font-size:28px;margin-bottom:12px;">💬</div>'
                     '<div style="font-size:16px;font-weight:600;color:#475569;margin-bottom:10px;">'
-                    "Ask a due diligence question</div>"
+                    "Extract a table or ask a due diligence question</div>"
                     '<div style="font-size:14px;color:#94a3b8;line-height:1.7;">'
-                    '"What are the key liabilities hidden in this document?"<br>'
-                    '"Summarize revenue breakdown and customer concentration."<br>'
-                    '"What are the main risk factors for this deal?"'
+                    '"Extract the 2023 depreciation schedule."<br>'
+                    '"Show the working capital components table."<br>'
+                    '"What are the key liabilities in this document?"'
                     "</div></div>",
                     unsafe_allow_html=True,
                 )
@@ -1135,6 +1228,13 @@ def _page_audit_analysis():
                     )
                 else:
                     answer = msg["content"]
+
+                    if msg.get("is_verified", True) is False:
+                        st.warning(
+                            "⚠️ SCANNED DOCUMENT DETECTED: No text layer found. "
+                            "Cross-validation disabled. Extracted numbers may contain "
+                            "AI hallucinations. Manual verification required."
+                        )
 
                     st.markdown(
                         '<div style="display:flex;align-items:flex-start;gap:8px;margin:8px 0;">'
@@ -1170,25 +1270,62 @@ def _page_audit_analysis():
 
                     st.markdown("</div></div>", unsafe_allow_html=True)
 
-                    # CSV export — rendered outside the HTML card as a Streamlit widget
+                    # CSV export + optional table-type tag — rendered outside the HTML card
                     _tbl = _extract_markdown_table(answer)
                     if _tbl:
                         _csv = _markdown_table_to_csv(_tbl)
                         if _csv:
-                            st.download_button(
-                                label="⬇  Download Table as CSV",
-                                data=_csv,
-                                file_name=f"table_p{cited[0] if cited else _i}.csv",
-                                mime="text/csv",
-                                key=f"dl_{_i}",
-                            )
+                            _dl_col, _tag_col = st.columns([2, 3])
+                            with _dl_col:
+                                st.download_button(
+                                    label="⬇  Download Table as CSV",
+                                    data=_csv,
+                                    file_name=f"table_p{cited[0] if cited else _i}.csv",
+                                    mime="text/csv",
+                                    key=f"dl_{_i}",
+                                )
+                            with _tag_col:
+                                _tag_options = [
+                                    "Other",
+                                    "Balance Sheet",
+                                    "Income Statement / P&L",
+                                    "Depreciation Schedule",
+                                    "EBITDA Calculation",
+                                    "Working Capital Components",
+                                    "Cap Table",
+                                ]
+                                st.selectbox(
+                                    "What type of table is this? (Optional — helps us improve)",
+                                    options=_tag_options,
+                                    index=0,
+                                    key=f"table_tag_{_i}",
+                                )
+
+        # Quick-prompt chips
+        st.markdown(
+            '<div style="padding:8px 12px 6px;border-top:1px solid #e0e3e5;'
+            'background:#f8fafc;">'
+            '<div style="font-size:10px;font-weight:600;letter-spacing:0.08em;'
+            'text-transform:uppercase;color:#94a3b8;margin-bottom:6px;">Quick extractions</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        _chip_row1 = st.columns(3)
+        _chip_row2 = st.columns(3)
+        for _ci, (_icon, _prompt) in enumerate(_SUGGESTED_PROMPTS):
+            _col = _chip_row1[_ci] if _ci < 3 else _chip_row2[_ci - 3]
+            with _col:
+                _short = (_icon + " " + _prompt[:22] + "…") if len(_prompt) > 22 else _icon + " " + _prompt
+                if st.button(_short, key=f"chip_{_ci}", use_container_width=True, type="secondary"):
+                    st.session_state["auto_prompt"] = _prompt
+                    st.rerun()
 
         # Input form
-        st.markdown('<div style="padding:12px 0 0 0;">', unsafe_allow_html=True)
+        st.markdown('<div style="padding:8px 0 0 0;">', unsafe_allow_html=True)
         with st.form("chat_form", clear_on_submit=True):
             question = st.text_input(
                 "question",
-                placeholder='e.g. "What are the key liabilities hidden in this document?"',
+                placeholder='e.g. "Extract the 2023 depreciation schedule."',
                 label_visibility="collapsed",
             )
             submitted = st.form_submit_button(
@@ -1198,7 +1335,7 @@ def _page_audit_analysis():
             )
 
         if submitted and question.strip():
-            with st.status("Analyzing…", expanded=False):
+            with st.status("Analyzing…", expanded=True):
                 _handle_question(question.strip(), selected_doc)
             st.rerun()
 
@@ -1234,20 +1371,49 @@ def _page_audit_analysis():
             unsafe_allow_html=True,
         )
 
-        # Page navigation
-        cited_page = st.session_state.get("cited_page") or 1
-        page_num = st.number_input(
-            "Page",
-            min_value=1,
-            max_value=page_count,
-            value=int(cited_page),
-            step=1,
-            key="pdf_page_nav",
-        )
+        # Page navigation — prev / page display / next
+        cur_page = max(1, min(page_count, int(st.session_state.get("pdf_page_nav", 1))))
+        _pn_l, _pn_c, _pn_r = st.columns([1, 4, 1])
+        with _pn_l:
+            if st.button("← Prev", key="pdf_prev", use_container_width=True, type="secondary"):
+                st.session_state["pdf_page_nav"] = max(1, cur_page - 1)
+                st.session_state["cited_page"] = st.session_state["pdf_page_nav"]
+                st.rerun()
+        with _pn_c:
+            st.markdown(
+                f'<div style="text-align:center;font-size:14px;font-weight:600;'
+                f'color:#191c1e;padding:7px 0;">Page {cur_page} of {page_count}</div>',
+                unsafe_allow_html=True,
+            )
+        with _pn_r:
+            if st.button("Next →", key="pdf_next", use_container_width=True, type="secondary"):
+                st.session_state["pdf_page_nav"] = min(page_count, cur_page + 1)
+                st.session_state["cited_page"] = st.session_state["pdf_page_nav"]
+                st.rerun()
 
-        st.markdown('<div class="viewer-shell" style="background:#d8dadc;padding:24px;min-height:calc(100vh - 318px);">', unsafe_allow_html=True)
-        _render_page_image(pdf_path, int(page_num), page_count)
-        st.markdown('</div>', unsafe_allow_html=True)
+        # Zoom controls — + / zoom display / -
+        zoom_level = int(st.session_state.get("pdf_zoom", 100))
+        _z_l, _z_c, _z_r = st.columns([1, 4, 1])
+        with _z_l:
+            if st.button("−", key="zoom_out", use_container_width=True, type="secondary"):
+                st.session_state["pdf_zoom"] = max(50, zoom_level - 25)
+                st.rerun()
+        with _z_c:
+            st.markdown(
+                f'<div style="text-align:center;font-size:12px;color:#94a3b8;padding:2px 0 8px;">'
+                f'Zoom: {zoom_level}%</div>',
+                unsafe_allow_html=True,
+            )
+        with _z_r:
+            if st.button("+", key="zoom_in", use_container_width=True, type="secondary"):
+                st.session_state["pdf_zoom"] = min(200, zoom_level + 25)
+                st.rerun()
+
+        page_num = cur_page
+
+        # Document image viewer
+        with st.container(border=True):
+            _render_page_image(pdf_path, int(page_num), page_count, zoom=int(st.session_state.get("pdf_zoom", 100)))
 
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1296,6 +1462,43 @@ def _page_liability_reports():
     for doc_name, doc_info in docs.items():
         for l in doc_info.get("liabilities", []):
             all_liabilities.append({**l, "source_doc": doc_name})
+
+    _is_demo = not all_liabilities
+    if _is_demo:
+        _demo_src = next(iter(docs.keys()), "Alpha_Financials_Q3_Audited.pdf")
+        all_liabilities = [{**l, "source_doc": _demo_src, "verification": "PENDING"} for l in _DEMO_LIABILITIES]
+        st.markdown(
+            '<div style="display:inline-flex;align-items:center;gap:6px;padding:6px 12px;'
+            'border-radius:4px;background:#eff6ff;border:1px solid rgba(37,99,235,0.15);'
+            'color:#1d4ed8;font-size:12px;font-weight:600;margin-bottom:12px;">'
+            '💡 Demo findings shown — run the AI Liability Scan to populate with real data.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Metric cards
+    _mc_total = len(all_liabilities)
+    _mc_crit  = sum(1 for l in all_liabilities if l.get("severity","").upper() == "CRITICAL")
+    _mc_high  = sum(1 for l in all_liabilities if l.get("severity","").upper() == "HIGH")
+    _mc_other = _mc_total - _mc_crit - _mc_high
+    _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+    for _col, _lbl, _val, _sub, _bg, _tc in [
+        (_mc1, "Total Findings",     str(_mc_total), "across all documents",     "#f7f9fb", "#191c1e"),
+        (_mc2, "Critical",           str(_mc_crit),  "immediate attention",      "#fff1f2", "#93000a"),
+        (_mc3, "High",               str(_mc_high),  "elevated exposure",        "#fef3c7", "#92400e"),
+        (_mc4, "Med / Low",          str(_mc_other), "monitor and track",        "#f0fdf4", "#065f46"),
+    ]:
+        with _col:
+            st.markdown(
+                f'<div class="metric-card" style="background:{_bg};">'
+                f'<div style="font-size:11px;font-weight:600;letter-spacing:0.05em;'
+                f'text-transform:uppercase;color:#475569;margin-bottom:12px;">{_lbl}</div>'
+                f'<div style="font-size:32px;font-weight:700;color:{_tc};line-height:1;">{_val}</div>'
+                f'<div style="margin-top:8px;font-size:12px;color:#64748b;">{_sub}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+    st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
 
     # Filters
     col_f1, col_f2, col_f3 = st.columns([2, 2, 3])

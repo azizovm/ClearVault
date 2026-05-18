@@ -1,33 +1,40 @@
 from __future__ import annotations
 
 import base64
-import io
 import os
 import re
 from typing import Optional
 
-import google.generativeai as genai
 from dotenv import load_dotenv
-from PIL import Image
+from groq import Groq
+
+from src.extractor import extract_page_text, find_pdf_path
 
 load_dotenv()
 
-_model: Optional[genai.GenerativeModel] = None
+_client: Optional[Groq] = None
+# Groq'ta mevcut vision-capable model — değiştirmek istersen .env'e GROQ_MODEL ekle
+_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
 
-def _get_model() -> genai.GenerativeModel:
-    global _model
-    if _model is None:
-        api_key = os.getenv("GEMINI_API_KEY")
+def _get_client() -> Groq:
+    global _client
+    if _client is None:
+        api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
-            raise ValueError("GEMINI_API_KEY is not set. Add it to your .env file.")
-        genai.configure(api_key=api_key)
-        _model = genai.GenerativeModel("gemini-2.0-flash")
-    return _model
+            raise ValueError("GROQ_API_KEY is not set. Add it to your .env file.")
+        _client = Groq(api_key=api_key)
+    return _client
 
 
-def _b64_to_pil(b64: str) -> Image.Image:
-    return Image.open(io.BytesIO(base64.b64decode(b64)))
+def _b64_to_data_url(b64: str) -> str:
+    return f"data:image/png;base64,{b64}"
+
+
+def _path_to_data_url(image_path: str) -> str:
+    with open(image_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
 
 
 _QA_PROMPT = """\
@@ -50,6 +57,7 @@ Structure your response as:
 3. [Markdown table — mandatory when extracting financial or tabular data]
 4. Risk Assessment (if applicable)"""
 
+
 _LIABILITY_PROMPT = """\
 You are an M&A risk analyst performing due diligence. Analyze the document pages \
 shown above and identify ALL liabilities, risks, and red flags visible in the images.
@@ -65,55 +73,207 @@ PAGE: page number
 Be thorough and conservative. Identify every material risk visible in the pages."""
 
 
-def answer_with_citations(question: str, chunks: list[dict]) -> dict:
-    """Answer a due diligence question from retrieved page images."""
-    model = _get_model()
+_GROUND_TRUTH_INSTRUCTION = """\
+GROUND TRUTH — RAW TEXT FROM PDF
 
-    content: list = []
+You have been given two sources for each page:
+  (a) a rendered image of the page, and
+  (b) the deterministic raw text extracted directly from the PDF text \
+layer (shown below).
+
+STRICT RULE: For any number, date, percentage, currency amount, or \
+proper noun appearing in your answer or in any Markdown table, you \
+MUST verify it against the raw text below. If the raw text and the \
+image disagree, the raw text is the ground truth — use the raw text \
+value. If the raw text is missing for a page (no text layer detected \
+or no source PDF located), you may rely on the image but you MUST \
+flag every such value with the marker ⚠️ unverified inline.
+
+Never silently emit a number that does not appear in the raw text \
+when raw text is present for that page."""
+
+
+def _flag_unverified_table(answer: str, has_raw_text: bool) -> str:
+    """Append ' ⚠️ unverified' to every number-containing data cell in every
+    Markdown table in the answer when no raw ground-truth text is available.
+    No-op when has_raw_text is True.
+    """
+    if has_raw_text:
+        return answer
+
+    _SEP_TOKEN = re.compile(r"^\s*:?-+:?\s*$")
+
+    def _is_separator(line: str) -> bool:
+        s = line.strip()
+        if s.count("|") < 1:
+            return False
+        tokens = [t for t in s.split("|") if t.strip()]
+        return bool(tokens) and all(_SEP_TOKEN.match(t) for t in tokens)
+
+    def _is_pipe_row(line: str) -> bool:
+        return line.strip().count("|") >= 2
+
+    def _inject(line: str) -> str:
+        parts = line.split("|")
+        if len(parts) < 3:
+            return line
+        out = [parts[0]]
+        for cell in parts[1:-1]:
+            stripped = cell.strip()
+            if not stripped or "⚠️ unverified" in cell:
+                out.append(cell)
+            elif re.search(r"\d", stripped):
+                rstripped = cell.rstrip()
+                trailing = cell[len(rstripped):]
+                out.append(rstripped + " ⚠️ unverified" + trailing)
+            else:
+                out.append(cell)
+        out.append(parts[-1])
+        return "|".join(out)
+
+    OUTSIDE, SAW_HEADER, IN_BODY = 0, 1, 2
+    state = OUTSIDE
+    out_lines = []
+
+    for line in answer.splitlines(keepends=False):
+        is_sep = _is_separator(line)
+        is_pipe = not is_sep and _is_pipe_row(line)
+
+        if state == OUTSIDE:
+            out_lines.append(line)
+            if is_pipe:
+                state = SAW_HEADER
+        elif state == SAW_HEADER:
+            if is_sep:
+                out_lines.append(line)
+                state = IN_BODY
+            else:
+                out_lines.append(line)
+                state = OUTSIDE
+        else:  # IN_BODY
+            if is_pipe:
+                out_lines.append(_inject(line))
+            else:
+                out_lines.append(line)
+                state = OUTSIDE
+
+    return "\n".join(out_lines)
+
+
+def answer_with_citations(question: str, chunks: list[dict], doc_name: str | None = None) -> dict:
+    """Answer a due diligence question from retrieved page images with raw-text cross-validation."""
+    client = _get_client()
+
+    image_blocks: list = []
     page_refs: list[int] = []
+    contributing_chunks: list[dict] = []
 
     for c in chunks:
         if c.get("base64"):
-            content.append(_b64_to_pil(c["base64"]))
+            image_blocks.append({
+                "type": "image_url",
+                "image_url": {"url": _b64_to_data_url(c["base64"])},
+            })
             page_refs.append(c["page_num"])
+            contributing_chunks.append(c)
 
-    if not content:
+    if not image_blocks:
         return {"answer": "No relevant pages found.", "cited_pages": [], "source_chunks": chunks}
 
-    page_label = ", ".join(f"Page {p}" for p in page_refs)
-    prompt = f"{_QA_PROMPT}\n\nShown pages: {page_label}.\n\nQuestion: {question}"
-    content.append(prompt)
+    # Resolve PDF path from doc_name parameter (all chunks come from the same document)
+    _doc_pdf_path: str | None = find_pdf_path(doc_name) if doc_name else None
 
-    response = model.generate_content(content)
-    answer = response.text
+    raw_text_sections: list[str] = []
+    has_raw_text = False
+    for c in contributing_chunks:
+        page_num = c["page_num"]
+        if "pdf_path" in c:
+            pdf_path: str | None = c["pdf_path"]
+        elif "doc_name" in c:
+            pdf_path = find_pdf_path(c["doc_name"])
+        elif _doc_pdf_path:
+            pdf_path = _doc_pdf_path
+        else:
+            raw_text_sections.append(
+                f"===== Raw text from Page {page_num} =====\n"
+                f"(no source PDF located on disk — verify visually)\n"
+            )
+            continue
+
+        if not pdf_path:
+            raw_text_sections.append(
+                f"===== Raw text from Page {page_num} =====\n"
+                f"(no source PDF located on disk — verify visually)\n"
+            )
+            continue
+
+        text = extract_page_text(pdf_path, page_num)
+        if text and text.strip():
+            has_raw_text = True
+            raw_text_sections.append(
+                f"===== Raw text from Page {page_num} =====\n{text}\n"
+            )
+        else:
+            raw_text_sections.append(
+                f"===== Raw text from Page {page_num} =====\n"
+                f"(no text layer detected on this page — verify visually)\n"
+            )
+
+    page_label = ", ".join(f"Page {p}" for p in page_refs)
+    full_prompt = (
+        _QA_PROMPT
+        + "\n\n" + _GROUND_TRUTH_INSTRUCTION
+        + "\n\n" + "\n".join(raw_text_sections)
+        + f"\n\nShown pages: {page_label}.\n\nQuestion: {question}"
+    )
+
+    content = image_blocks + [{"type": "text", "text": full_prompt}]
+
+    response = client.chat.completions.create(
+        model=_MODEL,
+        messages=[{"role": "user", "content": content}],
+        max_tokens=2048,
+    )
+    answer = response.choices[0].message.content or ""
+    answer = _flag_unverified_table(answer, has_raw_text=has_raw_text)
     cited_pages = sorted(set(int(m) for m in re.findall(r"\[Page (\d+)\]", answer)))
 
     return {
         "answer": answer,
         "cited_pages": cited_pages,
         "source_chunks": chunks,
+        "is_verified": has_raw_text,
     }
 
 
 def extract_liabilities(scan_pages: list[dict]) -> list[dict]:
-    """Scan sampled document pages for liabilities using Gemini Vision."""
-    model = _get_model()
+    """Scan sampled document pages for liabilities using Groq Vision."""
+    client = _get_client()
 
-    content: list = []
+    image_blocks: list = []
     for p in scan_pages:
         try:
-            content.append(Image.open(p["image_path"]))
+            image_blocks.append({
+                "type": "image_url",
+                "image_url": {"url": _path_to_data_url(p["image_path"])},
+            })
         except Exception:
             pass
 
-    if not content:
+    if not image_blocks:
         return []
 
-    content.append(_LIABILITY_PROMPT)
-    response = model.generate_content(content)
+    content = image_blocks + [{"type": "text", "text": _LIABILITY_PROMPT}]
+
+    response = client.chat.completions.create(
+        model=_MODEL,
+        messages=[{"role": "user", "content": content}],
+        max_tokens=2048,
+    )
+    text = response.choices[0].message.content or ""
 
     findings: list[dict] = []
-    for block in response.text.split("---"):
+    for block in text.split("---"):
         block = block.strip()
         if not block:
             continue
