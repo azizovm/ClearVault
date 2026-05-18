@@ -2,7 +2,11 @@
 __pycache__/
 *.pyc
 .env
+.env.*
 chroma_db/
 data/
+.byaldi/
 *.log
 .idea/
+.DS_Store
+.streamlit/secrets.toml
