@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from groq import Groq
 
 from src.extractor import extract_page_text, find_pdf_path
+from src.provenance import resolve_table_provenance, _extract_table_from_answer
 
 load_dotenv()
 
@@ -160,6 +161,45 @@ def _flag_unverified_table(answer: str, has_raw_text: bool) -> str:
     return "\n".join(out_lines)
 
 
+def _extract_highlight_terms(raw_text_sections: list[str]) -> list[str]:
+    """Return searchable terms derived deterministically from raw PDF text (never from LLM output).
+
+    Extracts up to 5 numeric tokens (dollar amounts, percentages, comma-separated numbers)
+    and up to 5 row-label strings (words before wide whitespace gaps, typical of financial tables).
+    """
+    combined = "\n".join(raw_text_sections)
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    for m in re.finditer(
+        r'\$[\d,]+(?:\.\d+)?[MBKmk]?'
+        r'|[\d,]+(?:\.\d+)?%'
+        r'|\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b',
+        combined,
+    ):
+        t = m.group().strip()
+        if t and t not in seen:
+            seen.add(t)
+            terms.append(t)
+        if len(terms) >= 5:
+            break
+
+    for line in combined.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        m = re.match(r'^([A-Za-z][A-Za-z &/()\-]{3,40})\s{2,}', stripped)
+        if m:
+            label = m.group(1).strip()
+            if label and label not in seen:
+                seen.add(label)
+                terms.append(label)
+        if len(terms) >= 10:
+            break
+
+    return terms
+
+
 def answer_with_citations(question: str, chunks: list[dict], doc_name: str | None = None) -> dict:
     """Answer a due diligence question from retrieved page images with raw-text cross-validation."""
     client = _get_client()
@@ -178,12 +218,22 @@ def answer_with_citations(question: str, chunks: list[dict], doc_name: str | Non
             contributing_chunks.append(c)
 
     if not image_blocks:
-        return {"answer": "No relevant pages found.", "cited_pages": [], "source_chunks": chunks}
+        return {
+            "answer": "No relevant pages found.",
+            "cited_pages": [],
+            "row_pages": [],
+            "highlight_terms_by_page": {},
+            "provenance_cited_pages": [],
+            "first_chunk_page": None,
+            "source_chunks": chunks,
+            "is_verified": False,
+        }
 
     # Resolve PDF path from doc_name parameter (all chunks come from the same document)
     _doc_pdf_path: str | None = find_pdf_path(doc_name) if doc_name else None
 
     raw_text_sections: list[str] = []
+    page_text_map: dict[int, str] = {}
     has_raw_text = False
     for c in contributing_chunks:
         page_num = c["page_num"]
@@ -210,6 +260,7 @@ def answer_with_citations(question: str, chunks: list[dict], doc_name: str | Non
         text = extract_page_text(pdf_path, page_num)
         if text and text.strip():
             has_raw_text = True
+            page_text_map[page_num] = text
             raw_text_sections.append(
                 f"===== Raw text from Page {page_num} =====\n{text}\n"
             )
@@ -218,6 +269,12 @@ def answer_with_citations(question: str, chunks: list[dict], doc_name: str | Non
                 f"===== Raw text from Page {page_num} =====\n"
                 f"(no text layer detected on this page — verify visually)\n"
             )
+
+    # Enrich chunks with extracted text so provenance resolver can string-match cells
+    enriched_chunks = [
+        {**c, "text": page_text_map.get(c["page_num"], "")}
+        for c in contributing_chunks
+    ]
 
     page_label = ", ".join(f"Page {p}" for p in page_refs)
     full_prompt = (
@@ -238,9 +295,19 @@ def answer_with_citations(question: str, chunks: list[dict], doc_name: str | Non
     answer = _flag_unverified_table(answer, has_raw_text=has_raw_text)
     cited_pages = sorted(set(int(m) for m in re.findall(r"\[Page (\d+)\]", answer)))
 
+    table_md = _extract_table_from_answer(answer)
+    if table_md:
+        prov = resolve_table_provenance(table_md, enriched_chunks)
+    else:
+        prov = {"row_pages": [], "highlight_terms_by_page": {}, "cited_pages": []}
+
     return {
         "answer": answer,
         "cited_pages": cited_pages,
+        "row_pages": prov["row_pages"],
+        "highlight_terms_by_page": prov["highlight_terms_by_page"],
+        "provenance_cited_pages": prov["cited_pages"],
+        "first_chunk_page": contributing_chunks[0]["page_num"] if contributing_chunks else None,
         "source_chunks": chunks,
         "is_verified": has_raw_text,
     }
