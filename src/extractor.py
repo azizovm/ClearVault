@@ -101,3 +101,62 @@ def find_pdf_path(doc_name: str) -> str | None:
         for match in search_root.rglob(name):
             return str(match)
     return None
+
+
+def render_thumbnail(pdf_path: str, page_num: int, search_terms: list[str]) -> bytes:
+    """Render a PDF page to a small PNG thumbnail (DPI=50) with highlight annotations.
+
+    Same highlight logic as render_page_with_highlights. Returns PNG bytes or b'' on failure.
+    """
+    try:
+        with fitz.open(pdf_path) as doc:
+            idx = page_num - 1
+            if idx < 0 or idx >= len(doc):
+                return b""
+            page = doc[idx]
+            for term in search_terms:
+                if not term.strip():
+                    continue
+                try:
+                    quads = page.search_for(term)
+                    if quads:
+                        page.add_highlight_annot(quads)
+                except Exception:
+                    pass
+            pix = page.get_pixmap(dpi=50)
+            return pix.tobytes("png")
+    except Exception:
+        return b""
+
+
+def render_page_with_highlights(
+    pdf_path: str, page_num: int, search_terms: list[str]
+) -> tuple[bytes, int]:
+    """Render a PDF page to PNG bytes with highlight annotations for matched terms.
+
+    Uses fitz to search for each term and add a yellow highlight annotation before
+    rasterising at 150 DPI. Terms not found in the page are silently skipped.
+    Returns (b'', 0) on any failure so callers can fall back to the plain renderer.
+    Returns (png_bytes, total_quad_count) on success.
+    """
+    try:
+        with fitz.open(pdf_path) as doc:
+            idx = page_num - 1
+            if idx < 0 or idx >= len(doc):
+                return b"", 0
+            page = doc[idx]
+            total_quads = 0
+            for term in search_terms:
+                if not term.strip():
+                    continue
+                try:
+                    quads = page.search_for(term)
+                    if quads:
+                        page.add_highlight_annot(quads)
+                        total_quads += len(quads)
+                except Exception:
+                    pass
+            pix = page.get_pixmap(dpi=150)
+            return pix.tobytes("png"), total_quads
+    except Exception:
+        return b"", 0

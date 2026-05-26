@@ -175,19 +175,26 @@ section[data-testid="stMain"] { background: var(--surface) !important; }
     letter-spacing: 0.05em !important;
     text-transform: uppercase !important;
 }
-[data-testid="stForm"] button,
-[data-testid="stForm"] .stButton > button,
+[data-testid="stForm"] [data-testid="stBaseButton-primary"],
+[data-testid="stForm"] .stButton > button[kind="primary"],
 .main .stButton > button[kind="primary"] {
     background: var(--navy) !important;
-    color: white !important;
+    color: #ffffff !important;
     border: none !important;
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.18) !important;
 }
-[data-testid="stForm"] button:hover,
-[data-testid="stForm"] .stButton > button:hover,
+[data-testid="stForm"] [data-testid="stBaseButton-primary"]:hover,
+[data-testid="stForm"] .stButton > button[kind="primary"]:hover,
 .main .stButton > button[kind="primary"]:hover {
     background: #1e293b !important;
 }
+
+/* Guard: ensure text inside light-bg Streamlit containers stays dark */
+.stMarkdown p, .stMarkdown li, .stMarkdown span:not([class*="material"]),
+[data-testid="stChatMessage"] p, [data-testid="stChatMessage"] span {
+    color: #0F172A;
+}
+[data-testid="stCaptionContainer"] p { color: var(--text-variant) !important; }
 .main .stButton > button[kind="secondary"] {
     background: white !important;
     color: var(--navy) !important;
@@ -317,6 +324,11 @@ button[data-testid="stBaseButton-secondary"].chip-btn {
     text-transform: none !important;
     letter-spacing: 0 !important;
 }
+
+/* ── Smooth scroll ── */
+html { scroll-behavior: smooth; }
+
+
 </style>
 """,
     unsafe_allow_html=True,
@@ -421,8 +433,13 @@ def _extract_markdown_table(text: str) -> str | None:
     return "\n".join(table_lines) if len(table_lines) >= 3 else None
 
 
-def _markdown_table_to_csv(table_md: str) -> str:
-    """Convert a Markdown pipe table to CSV via pandas."""
+def _markdown_table_to_csv(table_md: str, row_pages: list[int | None] | None = None) -> str:
+    """Convert a Markdown pipe table to CSV via pandas.
+
+    If row_pages is provided, a "Source Page" column is appended as the final column.
+    Each data row i receives str(row_pages[i]) when an int, "Unresolved" when None,
+    or "Unresolved" when index exceeds the list. Values are never blanked or guessed.
+    """
     rows = []
     for line in table_md.strip().split("\n"):
         if re.match(r"^[\|\s\-:]+$", line.strip()):
@@ -434,6 +451,15 @@ def _markdown_table_to_csv(table_md: str) -> str:
         return ""
     max_cols = max(len(r) for r in rows)
     rows = [r + [""] * (max_cols - len(r)) for r in rows]
+    if row_pages is not None:
+        rows[0] = rows[0] + ["Source Page"]
+        for i, row in enumerate(rows[1:], 0):
+            if i < len(row_pages):
+                p = row_pages[i]
+                page_str = str(p) if p is not None else "Unresolved"
+            else:
+                page_str = "Unresolved"
+            rows[i + 1] = row + [page_str]
     df = pd.DataFrame(rows[1:], columns=rows[0])
     buf = io.StringIO()
     df.to_csv(buf, index=False)
@@ -486,6 +512,7 @@ def _init_state():
         "cited_page": None,
         "auto_prompt": None,
         "pdf_page_nav": 1,
+        "pdf_current_page": 1,
         "pdf_zoom": 100,
     }
     for k, v in defaults.items():
@@ -1042,6 +1069,10 @@ def _page_document_hub():
 
 # ── Page: Audit Analysis ──────────────────────────────────────────────────────
 
+def _set_page(p: int) -> None:
+    st.session_state["pdf_current_page"] = p
+
+
 def _handle_question(question: str, doc_name: str):
     from src.vector_store import query_document
     from src.llm import answer_with_citations
@@ -1062,8 +1093,19 @@ def _handle_question(question: str, doc_name: str):
             "content": result["answer"],
             "cited_pages": result["cited_pages"],
             "is_verified": result.get("is_verified", True),
+            "highlight_terms_by_page": result.get("highlight_terms_by_page", {}),
+            "row_pages": result.get("row_pages", []),
+            "provenance_cited_pages": result.get("provenance_cited_pages", []),
+            "first_chunk_page": result.get("first_chunk_page"),
         }
     )
+    _prov = result.get("provenance_cited_pages", [])
+    if _prov:
+        st.session_state["pdf_current_page"] = _prov[0]
+    elif result["cited_pages"]:
+        st.session_state["pdf_current_page"] = result["cited_pages"][0]
+    elif result.get("first_chunk_page"):
+        st.session_state["pdf_current_page"] = result["first_chunk_page"]
     if result["cited_pages"]:
         st.session_state.cited_page = result["cited_pages"][0]
         st.session_state["pdf_page_nav"] = result["cited_pages"][0]
@@ -1180,172 +1222,167 @@ def _page_audit_analysis():
 
     # ── Left: chat ────────────────────────────────────────────────────────────
     with chat_col:
-        st.markdown(
-            '<div class="chat-shell" style="height:calc(100vh - 206px);display:flex;flex-direction:column;overflow:hidden;">',
-            unsafe_allow_html=True,
-        )
+        with st.container(border=True):
+            # Chat header
+            st.markdown(
+                '<div style="padding:12px 16px;border-bottom:1px solid #e0e3e5;display:flex;align-items:center;justify-content:space-between;background:#f7f9fb;">'
+                '<div style="display:flex;align-items:center;gap:8px;">'
+                f'{_clearvault_mark(size=22)}'
+                '<span style="font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#191c1e;">Analysis Terminal</span>'
+                "</div>"
+                '<div style="display:flex;align-items:center;gap:6px;">'
+                '<div style="width:8px;height:8px;border-radius:9999px;background:#069669;animation:pulse 2s infinite;"></div>'
+                '<span style="font-size:12px;color:#475569;">Groq · Vision</span>'
+                "</div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
-        # Chat header
-        st.markdown(
-            '<div style="padding:12px 16px;border-bottom:1px solid #e0e3e5;display:flex;align-items:center;justify-content:space-between;background:#f7f9fb;">'
-            '<div style="display:flex;align-items:center;gap:8px;">'
-            f'{_clearvault_mark(size=22)}'
-            '<span style="font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#191c1e;">Analysis Terminal</span>'
-            "</div>"
-            '<div style="display:flex;align-items:center;gap:6px;">'
-            '<div style="width:8px;height:8px;border-radius:9999px;background:#069669;animation:pulse 2s infinite;"></div>'
-            '<span style="font-size:12px;color:#475569;">Groq · Vision</span>'
-            "</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-
-        # Chat history
-        chat_area = st.container(height=360)
-        with chat_area:
-            if not st.session_state.chat_history:
-                st.markdown(
-                    '<div style="text-align:center;padding:48px 16px;color:#94a3b8;">'
-                    '<div style="font-size:28px;margin-bottom:12px;">💬</div>'
-                    '<div style="font-size:16px;font-weight:600;color:#475569;margin-bottom:10px;">'
-                    "Extract a table or ask a due diligence question</div>"
-                    '<div style="font-size:14px;color:#94a3b8;line-height:1.7;">'
-                    '"Extract the 2023 depreciation schedule."<br>'
-                    '"Show the working capital components table."<br>'
-                    '"What are the key liabilities in this document?"'
-                    "</div></div>",
-                    unsafe_allow_html=True,
-                )
-
-            for _i, msg in enumerate(st.session_state.chat_history):
-                if msg["role"] == "user":
+            # Chat history
+            chat_area = st.container(height=360)
+            with chat_area:
+                if not st.session_state.chat_history:
                     st.markdown(
-                        f'<div style="display:flex;justify-content:flex-end;margin:8px 0;">'
-                        f'<div style="background:#eceef0;border:1px solid #e0e3e5;color:#191c1e;'
-                        f'padding:12px 16px;border-radius:8px 8px 2px 8px;font-size:14px;'
-                        f'max-width:85%;line-height:1.6;">{msg["content"]}</div></div>',
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    answer = msg["content"]
-
-                    if msg.get("is_verified", True) is False:
-                        st.warning(
-                            "⚠️ SCANNED DOCUMENT DETECTED: No text layer found. "
-                            "Cross-validation disabled. Extracted numbers may contain "
-                            "AI hallucinations. Manual verification required."
-                        )
-
-                    st.markdown(
-                        '<div style="display:flex;align-items:flex-start;gap:8px;margin:8px 0;">'
-                        '<div style="width:28px;height:28px;background:#0f172a;border-radius:4px;'
-                        'display:flex;align-items:center;justify-content:center;'
-                        'flex-shrink:0;font-size:14px;color:white;margin-top:2px;">✦</div>'
-                        '<div style="flex:1;">'
-                        '<div style="font-size:13px;font-weight:600;color:#475569;margin-bottom:6px;">Audit Assistant</div>'
-                        '<div style="background:white;border:1px solid #e0e3e5;box-shadow:0 1px 3px rgba(0,0,0,0.04);'
-                        f'padding:16px;border-radius:2px 8px 8px 8px;font-size:14px;color:#191c1e;'
-                        f'line-height:1.6;white-space:pre-wrap;">{answer}</div>',
+                        '<div style="text-align:center;padding:48px 16px;color:#94a3b8;">'
+                        '<div style="font-size:28px;margin-bottom:12px;">💬</div>'
+                        '<div style="font-size:16px;font-weight:600;color:#475569;margin-bottom:10px;">'
+                        "Extract a table or ask a due diligence question</div>"
+                        '<div style="font-size:14px;color:#94a3b8;line-height:1.7;">'
+                        '"Extract the 2023 depreciation schedule."<br>'
+                        '"Show the working capital components table."<br>'
+                        '"What are the key liabilities in this document?"'
+                        "</div></div>",
                         unsafe_allow_html=True,
                     )
 
-                    # Citation chips
-                    cited = msg.get("cited_pages", [])
-                    if cited:
-                        chips = ""
-                        for p in cited:
-                            chips += (
-                                f'<span style="display:inline-flex;align-items:center;gap:4px;'
-                                f'background:#eff6ff;color:#1d4ed8;border:1px solid rgba(37,99,235,0.15);'
-                                f'padding:4px 10px;border-radius:4px;font-size:12px;font-weight:600;'
-                                f'cursor:pointer;margin:2px;" '
-                                f'title="Cited on page {p}">📄 Pg {p}</span>'
-                            )
+                for _i, msg in enumerate(st.session_state.chat_history):
+                    if msg["role"] == "user":
                         st.markdown(
-                            f'<div style="margin-top:8px;padding-top:8px;border-top:1px solid #f1f5f9;">'
-                            f'<span style="font-size:12px;color:#94a3b8;margin-right:6px;">Source Citations:</span>'
-                            f"{chips}</div>",
+                            f'<div style="display:flex;justify-content:flex-end;margin:8px 0;">'
+                            f'<div style="background:#eceef0;border:1px solid #e0e3e5;color:#191c1e;'
+                            f'padding:12px 16px;border-radius:8px 8px 2px 8px;font-size:14px;'
+                            f'max-width:85%;line-height:1.6;">{msg["content"]}</div></div>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        answer = msg["content"]
+
+                        if msg.get("is_verified", True) is False:
+                            st.warning(
+                                "⚠️ SCANNED DOCUMENT DETECTED: No text layer found. "
+                                "Cross-validation disabled. Extracted numbers may contain "
+                                "AI hallucinations. Manual verification required."
+                            )
+
+                        st.markdown(
+                            '<div style="display:flex;align-items:flex-start;gap:8px;margin:8px 0;">'
+                            '<div style="width:28px;height:28px;background:#0f172a;border-radius:4px;'
+                            'display:flex;align-items:center;justify-content:center;'
+                            'flex-shrink:0;font-size:14px;color:white;margin-top:2px;">✦</div>'
+                            '<div style="flex:1;">'
+                            '<div style="font-size:13px;font-weight:600;color:#475569;margin-bottom:6px;">Audit Assistant</div>'
+                            '<div style="background:white;border:1px solid #e0e3e5;box-shadow:0 1px 3px rgba(0,0,0,0.04);'
+                            f'padding:16px;border-radius:2px 8px 8px 8px;font-size:14px;color:#191c1e;'
+                            f'line-height:1.6;white-space:pre-wrap;">{answer}</div>',
                             unsafe_allow_html=True,
                         )
 
-                    st.markdown("</div></div>", unsafe_allow_html=True)
-
-                    # CSV export + optional table-type tag — rendered outside the HTML card
-                    _tbl = _extract_markdown_table(answer)
-                    if _tbl:
-                        _csv = _markdown_table_to_csv(_tbl)
-                        if _csv:
-                            _dl_col, _tag_col = st.columns([2, 3])
-                            with _dl_col:
-                                st.download_button(
-                                    label="⬇  Download Table as CSV",
-                                    data=_csv,
-                                    file_name=f"table_p{cited[0] if cited else _i}.csv",
-                                    mime="text/csv",
-                                    key=f"dl_{_i}",
+                        # Citation chips
+                        cited = msg.get("cited_pages", [])
+                        if cited:
+                            chips = ""
+                            for p in cited:
+                                chips += (
+                                    f'<span style="display:inline-flex;align-items:center;gap:4px;'
+                                    f'background:#eff6ff;color:#1d4ed8;border:1px solid rgba(37,99,235,0.15);'
+                                    f'padding:4px 10px;border-radius:4px;font-size:12px;font-weight:600;'
+                                    f'cursor:pointer;margin:2px;" '
+                                    f'title="Cited on page {p}">📄 Pg {p}</span>'
                                 )
-                            with _tag_col:
-                                _tag_options = [
-                                    "Other",
-                                    "Balance Sheet",
-                                    "Income Statement / P&L",
-                                    "Depreciation Schedule",
-                                    "EBITDA Calculation",
-                                    "Working Capital Components",
-                                    "Cap Table",
-                                ]
-                                st.selectbox(
-                                    "What type of table is this? (Optional — helps us improve)",
-                                    options=_tag_options,
-                                    index=0,
-                                    key=f"table_tag_{_i}",
-                                )
+                            st.markdown(
+                                f'<div style="margin-top:8px;padding-top:8px;border-top:1px solid #f1f5f9;">'
+                                f'<span style="font-size:12px;color:#94a3b8;margin-right:6px;">Source Citations:</span>'
+                                f"{chips}</div>",
+                                unsafe_allow_html=True,
+                            )
 
-        # Quick-prompt chips
-        st.markdown(
-            '<div style="padding:8px 12px 6px;border-top:1px solid #e0e3e5;'
-            'background:#f8fafc;">'
-            '<div style="font-size:10px;font-weight:600;letter-spacing:0.08em;'
-            'text-transform:uppercase;color:#94a3b8;margin-bottom:6px;">Quick extractions</div>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-        _chip_row1 = st.columns(3)
-        _chip_row2 = st.columns(3)
-        for _ci, (_icon, _prompt) in enumerate(_SUGGESTED_PROMPTS):
-            _col = _chip_row1[_ci] if _ci < 3 else _chip_row2[_ci - 3]
-            with _col:
-                _short = (_icon + " " + _prompt[:22] + "…") if len(_prompt) > 22 else _icon + " " + _prompt
-                if st.button(_short, key=f"chip_{_ci}", use_container_width=True, type="secondary"):
-                    st.session_state["auto_prompt"] = _prompt
-                    st.rerun()
+                        st.markdown("</div></div>", unsafe_allow_html=True)
 
-        # Input form
-        st.markdown('<div style="padding:8px 0 0 0;">', unsafe_allow_html=True)
-        with st.form("chat_form", clear_on_submit=True):
-            question = st.text_input(
-                "question",
-                placeholder='e.g. "Extract the 2023 depreciation schedule."',
-                label_visibility="collapsed",
+                        # CSV export + optional table-type tag — rendered outside the HTML card
+                        _tbl = _extract_markdown_table(answer)
+                        if _tbl:
+                            _row_pages = msg.get("row_pages") or None
+                            _csv = _markdown_table_to_csv(_tbl, row_pages=_row_pages)
+                            if _csv:
+                                _dl_col, _tag_col = st.columns([2, 3])
+                                with _dl_col:
+                                    st.download_button(
+                                        label="⬇  Download Table as CSV",
+                                        data=_csv,
+                                        file_name=f"table_p{cited[0] if cited else _i}.csv",
+                                        mime="text/csv",
+                                        key=f"dl_{_i}",
+                                    )
+                                with _tag_col:
+                                    _tag_options = [
+                                        "Other",
+                                        "Balance Sheet",
+                                        "Income Statement / P&L",
+                                        "Depreciation Schedule",
+                                        "EBITDA Calculation",
+                                        "Working Capital Components",
+                                        "Cap Table",
+                                    ]
+                                    st.selectbox(
+                                        "What type of table is this? (Optional — helps us improve)",
+                                        options=_tag_options,
+                                        index=0,
+                                        key=f"table_tag_{_i}",
+                                    )
+
+            # Quick-prompt chips
+            st.markdown(
+                '<div style="padding:8px 12px 6px;border-top:1px solid #e0e3e5;'
+                'background:#f8fafc;">'
+                '<div style="font-size:10px;font-weight:600;letter-spacing:0.08em;'
+                'text-transform:uppercase;color:#94a3b8;margin-bottom:6px;">Quick extractions</div>'
+                '</div>',
+                unsafe_allow_html=True,
             )
-            submitted = st.form_submit_button(
-                "Execute  →",
-                type="primary",
-                use_container_width=True,
+            _chip_row1 = st.columns(3)
+            _chip_row2 = st.columns(3)
+            for _ci, (_icon, _prompt) in enumerate(_SUGGESTED_PROMPTS):
+                _col = _chip_row1[_ci] if _ci < 3 else _chip_row2[_ci - 3]
+                with _col:
+                    _short = (_icon + " " + _prompt[:22] + "…") if len(_prompt) > 22 else _icon + " " + _prompt
+                    if st.button(_short, key=f"chip_{_ci}", use_container_width=True, type="secondary"):
+                        st.session_state["auto_prompt"] = _prompt
+                        st.rerun()
+
+            # Input form
+            with st.form("chat_form", clear_on_submit=True):
+                question = st.text_input(
+                    "question",
+                    placeholder='e.g. "Extract the 2023 depreciation schedule."',
+                    label_visibility="collapsed",
+                )
+                submitted = st.form_submit_button(
+                    "Execute  →",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if submitted and question.strip():
+                with st.status("Analyzing…", expanded=True):
+                    _handle_question(question.strip(), selected_doc)
+                st.rerun()
+
+            st.markdown(
+                '<div style="text-align:center;padding:6px 0;">'
+                '<span style="font-size:11px;color:#94a3b8;">AI analysis may require human verification.</span>'
+                "</div>",
+                unsafe_allow_html=True,
             )
-
-        if submitted and question.strip():
-            with st.status("Analyzing…", expanded=True):
-                _handle_question(question.strip(), selected_doc)
-            st.rerun()
-
-        st.markdown(
-            '<div style="text-align:center;padding:6px 0;">'
-            '<span style="font-size:11px;color:#94a3b8;">AI analysis may require human verification.</span>'
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
 
     # ── Right: PDF viewer ─────────────────────────────────────────────────────
     with pdf_col:
@@ -1372,12 +1409,11 @@ def _page_audit_analysis():
         )
 
         # Page navigation — prev / page display / next
-        cur_page = max(1, min(page_count, int(st.session_state.get("pdf_page_nav", 1))))
+        cur_page = max(1, min(page_count, int(st.session_state.get("pdf_current_page", 1))))
         _pn_l, _pn_c, _pn_r = st.columns([1, 4, 1])
         with _pn_l:
             if st.button("← Prev", key="pdf_prev", use_container_width=True, type="secondary"):
-                st.session_state["pdf_page_nav"] = max(1, cur_page - 1)
-                st.session_state["cited_page"] = st.session_state["pdf_page_nav"]
+                st.session_state["pdf_current_page"] = max(1, cur_page - 1)
                 st.rerun()
         with _pn_c:
             st.markdown(
@@ -1387,8 +1423,7 @@ def _page_audit_analysis():
             )
         with _pn_r:
             if st.button("Next →", key="pdf_next", use_container_width=True, type="secondary"):
-                st.session_state["pdf_page_nav"] = min(page_count, cur_page + 1)
-                st.session_state["cited_page"] = st.session_state["pdf_page_nav"]
+                st.session_state["pdf_current_page"] = min(page_count, cur_page + 1)
                 st.rerun()
 
         # Zoom controls — + / zoom display / -
@@ -1409,11 +1444,67 @@ def _page_audit_analysis():
                 st.session_state["pdf_zoom"] = min(200, zoom_level + 25)
                 st.rerun()
 
-        page_num = cur_page
+        # Collect provenance data from the most recent assistant message
+        _prov_cited: list[int] = []
+        _hl_by_page: dict[int, list[str]] = {}
+        _first_chunk_pg: int | None = None
+        _has_answer = False
+        for _msg in reversed(st.session_state.chat_history):
+            if _msg["role"] == "assistant":
+                _prov_cited = _msg.get("provenance_cited_pages", [])
+                _hl_by_page = _msg.get("highlight_terms_by_page", {})
+                _first_chunk_pg = _msg.get("first_chunk_page")
+                _has_answer = True
+                break
 
-        # Document image viewer
-        with st.container(border=True):
-            _render_page_image(pdf_path, int(page_num), page_count, zoom=int(st.session_state.get("pdf_zoom", 100)))
+        from src.extractor import render_page_with_highlights, render_thumbnail
+
+        _query_id = sum(1 for _m in st.session_state.chat_history if _m["role"] == "assistant")
+
+        if len(_prov_cited) >= 2:
+            # Thumbnail strip on left + single highlighted page on right
+            _thumb_col, _main_col = st.columns([1, 6])
+            with _thumb_col:
+                for _n in _prov_cited:
+                    _thumb_bytes = render_thumbnail(pdf_path, _n, _hl_by_page.get(_n, []))
+                    if _thumb_bytes:
+                        st.image(_thumb_bytes, use_container_width=True)
+                    st.button(
+                        f"Page {_n}",
+                        key=f"cv_thumb_btn_{_n}_{_query_id}",
+                        on_click=_set_page,
+                        args=(_n,),
+                        use_container_width=True,
+                    )
+            with _main_col:
+                st.caption(
+                    f"Page {cur_page}  ·  Highlights on: {', '.join(str(_p) for _p in _prov_cited)}"
+                )
+                _terms = _hl_by_page.get(cur_page, [])
+                _png, _ = render_page_with_highlights(pdf_path, cur_page, _terms)
+                if _png:
+                    st.image(_png, use_container_width=True)
+                else:
+                    _render_page_image(pdf_path, cur_page, page_count, zoom=zoom_level)
+
+        elif len(_prov_cited) == 1:
+            _pn = _prov_cited[0]
+            _terms = _hl_by_page.get(_pn, [])
+            _png, _ = render_page_with_highlights(pdf_path, _pn, _terms)
+            if _png:
+                st.image(_png, caption=f"Page {_pn}", use_container_width=True)
+            else:
+                _render_page_image(pdf_path, _pn, page_count, zoom=zoom_level)
+
+        elif _has_answer and _first_chunk_pg is not None:
+            with st.container(border=True):
+                _render_page_image(pdf_path, _first_chunk_pg, page_count, zoom=zoom_level)
+            st.caption("No deterministic source matches found for this answer.")
+
+        else:
+            # No answer yet — show nav-controlled page
+            with st.container(border=True):
+                _render_page_image(pdf_path, cur_page, page_count, zoom=zoom_level)
 
     st.markdown('</div>', unsafe_allow_html=True)
 
